@@ -22,6 +22,8 @@ TOKEN_KEYS = (
     "output_tokens",
 )
 
+PROMPT_LIMIT = 72
+
 
 def session_id_from_file(path: Path) -> Optional[str]:
     """Read the session ID from the first session_meta record."""
@@ -109,13 +111,8 @@ def list_session_ids() -> list[str]:
     return sorted(session_ids)
 
 
-def cumulative_usage(line: str) -> Optional[dict[str, int]]:
+def cumulative_usage(record: dict) -> Optional[dict[str, int]]:
     """Extract cumulative token counters from a token_count event."""
-    try:
-        record = json.loads(line)
-    except json.JSONDecodeError:
-        return None
-
     payload = record.get("payload", {})
     if record.get("type") != "event_msg" or payload.get("type") != "token_count":
         return None
@@ -130,22 +127,107 @@ def cumulative_usage(line: str) -> Optional[dict[str, int]]:
     }
 
 
+def parse_record(line: str) -> Optional[dict]:
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
+def turn_started(record: dict) -> Optional[str]:
+    payload = record.get("payload", {})
+    if record.get("type") != "event_msg" or payload.get("type") != "task_started":
+        return None
+
+    turn_id = payload.get("turn_id")
+    return str(turn_id) if turn_id else None
+
+
+def user_prompt(record: dict) -> Optional[str]:
+    payload = record.get("payload", {})
+    if record.get("type") != "event_msg" or payload.get("type") != "user_message":
+        return None
+
+    message = payload.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    return None
+
+
+def format_prompt(text: Optional[str]) -> str:
+    if not text:
+        return "-"
+
+    compact = " ".join(text.split())
+    if len(compact) <= PROMPT_LIMIT:
+        return compact
+    return compact[: PROMPT_LIMIT - 1].rstrip() + "…"
+
+
+def print_usage_row(call_number: int, delta: dict[str, int], prompt: Optional[str]) -> None:
+    uncached = max(
+        0,
+        delta["input_tokens"] - delta["cached_input_tokens"],
+    )
+
+    print(
+        f"{call_number:>4}  "
+        f"{delta['input_tokens']:>10,}  "
+        f"{delta['cached_input_tokens']:>10,}  "
+        f"{uncached:>10,}  "
+        f"{delta['output_tokens']:>10,}  "
+        f"{format_prompt(prompt)}",
+        flush=True,
+    )
+
+
 def watch(path: Path, session_id: str, poll: float) -> None:
     previous = {key: 0 for key in TOKEN_KEYS}
+    call_number = 0
+    active_turn_id = None
+    active_prompt = None
 
     with path.open("r", encoding="utf-8", errors="replace") as log:
-        # Existing records establish a baseline; only new requests are printed.
-        for line in log:
-            usage = cumulative_usage(line)
-            if usage is not None:
-                previous = usage
-
         print(f"Session: {session_id}")
         print(f"Rollout: {path}\n")
-        print("call  input       cached      uncached    output")
-        print("----  ----------  ----------  ----------  ----------")
+        print("call  input       cached      uncached    output      prompt")
+        print("----  ----------  ----------  ----------  ----------  ------------------------")
 
-        call_number = 0
+        # Replay existing records so the full history is visible first.
+        for line in log:
+            record = parse_record(line)
+            if record is None:
+                continue
+
+            next_turn_id = turn_started(record)
+            if next_turn_id is not None:
+                active_turn_id = next_turn_id
+                active_prompt = None
+
+            prompt = user_prompt(record)
+            if prompt is not None and active_turn_id is not None and active_prompt is None:
+                active_prompt = prompt
+
+            usage = cumulative_usage(record)
+            if usage is not None:
+                delta = {
+                    key: usage[key] - previous[key]
+                    for key in TOKEN_KEYS
+                }
+
+                if any(value < 0 for value in delta.values()):
+                    previous = usage
+                    print("[token counters reset; baseline updated]", flush=True)
+                    continue
+
+                if not any(delta.values()):
+                    previous = usage
+                    continue
+
+                call_number += 1
+
+                print_usage_row(call_number, delta, active_prompt)
+                previous = usage
 
         while True:
             line = log.readline()
@@ -153,7 +235,20 @@ def watch(path: Path, session_id: str, poll: float) -> None:
                 time.sleep(poll)
                 continue
 
-            current = cumulative_usage(line)
+            record = parse_record(line)
+            if record is None:
+                continue
+
+            next_turn_id = turn_started(record)
+            if next_turn_id is not None:
+                active_turn_id = next_turn_id
+                active_prompt = None
+
+            prompt = user_prompt(record)
+            if prompt is not None and active_turn_id is not None and active_prompt is None:
+                active_prompt = prompt
+
+            current = cumulative_usage(record)
             if current is None:
                 continue
 
@@ -173,19 +268,7 @@ def watch(path: Path, session_id: str, poll: float) -> None:
                 continue
 
             call_number += 1
-            uncached = max(
-                0,
-                delta["input_tokens"] - delta["cached_input_tokens"],
-            )
-
-            print(
-                f"{call_number:>4}  "
-                f"{delta['input_tokens']:>10,}  "
-                f"{delta['cached_input_tokens']:>10,}  "
-                f"{uncached:>10,}  "
-                f"{delta['output_tokens']:>10,}",
-                flush=True,
-            )
+            print_usage_row(call_number, delta, active_prompt)
             previous = current
 
 
@@ -227,4 +310,3 @@ if __name__ == "__main__":
         pass
     except (FileNotFoundError, PermissionError) as exc:
         raise SystemExit(f"Error: {exc}")
-
